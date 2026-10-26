@@ -1,0 +1,5 @@
+# Additional packages only (PyTorch + CUDA pre-installed in base image)
+ultralytics>=8.2.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+flask>=3.0.0

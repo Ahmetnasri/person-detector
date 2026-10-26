@@ -1,0 +1,72 @@
+services:
+  basel-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: basel-detector:latest
+    container_name: basel-detector
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      SOURCE: ${SOURCE:-/dev/video2}
+      MODEL: ${MODEL:-/app/yolo26n-seg.pt}
+      DEVICE: ${DEVICE:-auto}
+      CONF: ${CONF:-0.25}
+      IMGSZ: ${IMGSZ:-640}
+      FRAME_GAP: ${FRAME_GAP:-15}
+      THRESHOLD: ${THRESHOLD:-0.70}
+      TRACK_THRESHOLD: ${TRACK_THRESHOLD:-0.60}
+      TRACK_IOU: ${TRACK_IOU:-0.30}
+      TRACK_TIMEOUT: ${TRACK_TIMEOUT:-3.0}
+      MIN_BOX: ${MIN_BOX:-48}
+      SAMPLE_INTERVAL: ${SAMPLE_INTERVAL:-3.0}
+      MAX_SAMPLES: ${MAX_SAMPLES:-30}
+      GALLERY: ${GALLERY:-/app/gallery_segmented}
+      COOLDOWN: ${COOLDOWN:-60.0}
+      HOST: ${HOST:-0.0.0.0}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-5000}
+      LATEST_COUNT: ${LATEST_COUNT:-12}
+    devices:
+      - /dev/video2:/dev/video2
+    volumes:
+      - ./gallery_segmented:/app/gallery_segmented
+      - ./data:/app/data
+      - ./yolo26n-seg.pt:/app/yolo26n-seg.pt:ro
+      - ./yolo26n.pt:/app/yolo26n.pt:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    ports:
+      - "${DASHBOARD_PORT:-5001}:5001"
+    command: >
+      python detect_and_email.py
+      --source ${SOURCE:-/dev/video2}
+      --model ${MODEL:-/app/yolo26n-seg.pt}
+      --conf ${CONF:-0.25}
+      --imgsz ${IMGSZ:-640}
+      --device ${DEVICE:-auto}
+      --frame-gap ${FRAME_GAP:-15}
+      --threshold ${THRESHOLD:-0.70}
+      --track-threshold ${TRACK_THRESHOLD:-0.60}
+      --track-iou ${TRACK_IOU:-0.30}
+      --track-timeout ${TRACK_TIMEOUT:-3.0}
+      --min-box ${MIN_BOX:-48}
+      --sample-interval ${SAMPLE_INTERVAL:-3.0}
+      --max-samples ${MAX_SAMPLES:-30}
+      --gallery ${GALLERY:-/app/gallery_segmented}
+      --cooldown ${COOLDOWN:-60.0}
+      --host ${HOST:-0.0.0.0}
+      --dashboard-port ${DASHBOARD_PORT:-5000}
+      --latest-count ${LATEST_COUNT:-12}
+      --dashboard
+      ${VERBOSE:+--verbose}
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+              count: all
