@@ -21,6 +21,7 @@ venv
 env
 .env
 .venv
+.venv-webcam
 
 # IDE
 .vscode
@@ -54,3 +55,4 @@ README.md
 
 # Test files
 tests/
+test_*.py

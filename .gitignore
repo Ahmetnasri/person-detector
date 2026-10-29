@@ -4,3 +4,5 @@ gallery_segmented/
 data/
 tests/
 .vscode/
+.venv-webcam/
+__pycache__/

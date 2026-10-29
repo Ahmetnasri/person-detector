@@ -23,5 +23,5 @@ RUN mkdir -p /app/gallery_segmented /app/data /app/data/models /app/data/ultraly
 
 EXPOSE 5000
 
-# The source is supplied from docker-compose/.env. Default is a webcam device when one is attached.
+# The dashboard captures browser webcam frames; Compose can select other sources.
 CMD ["python", "detect_and_email.py", "--model", "/app/yolo26n-seg.pt", "--dashboard", "--host", "0.0.0.0", "--dashboard-port", "5000"]

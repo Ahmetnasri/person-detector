@@ -1,184 +1,78 @@
 # Person Detector
 
-A GPU-accelerated person detection and re-identification app built with YOLO segmentation, MobileNet embeddings, a live dashboard, and optional email alerts for new detections.
+YOLO person segmentation and MobileNet re-identification, with a live dashboard, a stored identity gallery, and optional email alerts. All application dependencies run inside one Docker image. No host Python installation or webcam helper is required.
 
-This project runs as a Dockerized application and is intended to work with one webcam at a time via environment configuration.
+## Start on Windows or Linux
 
-## Features
+On Windows use Docker Desktop with Linux containers and the WSL 2 backend. On Linux use Docker Engine with Compose or Docker Desktop.
 
-- YOLO segmentation for person detection
-- MobileNet-based embeddings for matching known vs new people
-- Gallery of stored identities and sample crops
-- Live dashboard with recent detections and identity list
-- Optional email alerts for newly detected people
-- CUDA GPU support via Docker
+1. Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell, or `cp .env.example .env` on Linux). For an existing `.env`, preserve your credentials and set `SOURCE=browser` and `DEVICE=auto`.
+2. Keep `yolo26n-seg.pt` in the project directory; Compose mounts it into the container. Leave the optional Linux `devices` and NVIDIA `deploy` blocks commented out initially.
+3. Build and start:
 
-## Project files
+   ```bash
+   docker compose up --build -d
+   ```
 
-- [detect_and_email.py](detect_and_email.py) — main application logic
-- [docker-compose.yml](docker-compose.yml) — container runtime configuration
-- [Dockerfile](Dockerfile) — Docker image definition
-- [.env](.env) — local runtime configuration (not committed for secrets)
-- [.env.example](.env.example) — example environment file
-- [requirements.txt](requirements.txt) — Python dependencies
+4. Open **http://localhost:5000**, click **Start camera**, and allow browser camera access. To change cameras, stop capture, select another camera, and start again. Device names may only appear after permission is granted.
 
-## Prerequisites
+The browser captures your webcam and uploads JPEG frames to detection inside Docker at up to four frames per second. Only the latest pending frame is kept so slow inference does not build a video backlog. `FRAME_GAP` applies to direct camera/video/stream sources; browser uploads are already rate limited.
 
-- Docker Engine installed
-- Docker Compose available
-- NVIDIA GPU and NVIDIA Container Toolkit for GPU acceleration
-- A webcam device available as `/dev/video0`, `/dev/video1`, etc., or another supported source like a file or RTSP stream
+**Browser mode requires the camera tab to stay open.** Closing it, navigating away, or stopping the camera ends capture; reopening the dashboard and clicking Start camera resumes it. Browsers may also throttle or suspend background tabs. The container, dashboard, and stored gallery remain available. Only one browser tab can send camera frames at a time; abandoned sessions expire after 15 seconds.
 
-## Quick start
+Camera permission requires `localhost` or HTTPS. The dashboard is published on host loopback by default; a remote browser camera would belong to that browser's machine, and remote access requires HTTPS and an explicitly configured host port binding.
 
-1. Copy the example environment file:
+## Keep detecting after closing the browser
 
-```bash
-cp .env.example .env
-```
+On native Linux Docker Engine, detection can read the webcam directly inside the container. In `.env` set:
 
-2. Edit [.env](.env) to choose the camera source:
-
-```env
+```dotenv
 SOURCE=0
-VIDEO_DEVICE=/dev/video0
-```
-
-For a second camera:
-
-```env
-SOURCE=2
 VIDEO_DEVICE=/dev/video2
-```
-
-3. Start the app:
-
-```bash
-docker compose up --build -d
-```
-
-4. Watch logs:
-
-```bash
-docker compose logs -f person-detector
-```
-
-5. Open the dashboard:
-
-```text
-http://localhost:5000
-```
-
-## Environment configuration
-
-The app is designed to be controlled mainly through [.env](.env).
-
-### Required settings
-
-- `SOURCE`: source to read from, such as `0`, `2`, a video file, or an RTSP URL
-- `VIDEO_DEVICE`: host device path for the selected webcam, such as `/dev/video0` or `/dev/video2`
-- `EMAIL_SENDER`, `EMAIL_PASSWORD`, `EMAIL_RECEIVER`: for email alerts
-
-### Example
-
-```env
-SOURCE=0
-VIDEO_DEVICE=/dev/video0
-MODEL=yolo26n-seg.pt
 DEVICE=auto
-DASHBOARD=true
-DASHBOARD_PORT=5000
 ```
 
-## Webcam selection
+Choose `VIDEO_DEVICE` from your host's `/dev/video*` devices. Uncomment the two lines in the Linux `devices` block in `docker-compose.yml`. The selected host device is mapped to `/dev/video0` inside the container, so keep `SOURCE=0` even when selecting host `/dev/video2`.
 
-To use webcam 1:
-
-```env
-SOURCE=0
-VIDEO_DEVICE=/dev/video0
-```
-
-To use webcam 2:
-
-```env
-SOURCE=2
-VIDEO_DEVICE=/dev/video2
-```
-
-If the selected camera is not connected, update the values accordingly or use a file/RTSP path instead.
-
-## Docker commands
-
-Build and start:
+Apply the configuration:
 
 ```bash
-docker compose up --build -d
+docker compose up -d --force-recreate
 ```
 
-Stop:
+This mode starts detection automatically and continues with the dashboard closed. Switch back to browser mode by setting `SOURCE=browser`, commenting out `devices`, and recreating the container.
 
-```bash
-docker compose down
-```
+On Windows Docker Desktop, browser capture stops when the camera tab closes. Unattended capture needs a network camera/stream or separately configured, compatible USB passthrough; a Linux container cannot directly open a Windows webcam API. Moving capture code into the image does not expose that hardware automatically.
 
-View logs:
+A network camera works unattended on either platform: set `SOURCE=rtsp://camera-address/stream`, leave `devices` commented out, and recreate the container. For a video file, place it in `data` and use `SOURCE=/app/data/test.mp4`.
+
+## Optional NVIDIA GPU
+
+Uncomment the entire `deploy` block in `docker-compose.yml` and run `docker compose up -d --force-recreate`. Keep `DEVICE=auto` to use CUDA when available, or set `DEVICE=cuda:0` to require it.
+
+Windows requires Docker Desktop's WSL 2 backend and a compatible NVIDIA Windows driver. Native Linux Engine requires the NVIDIA Container Toolkit. See [Docker GPU prerequisites](https://docs.docker.com/desktop/features/gpu/). CPU operation uses the same CUDA-capable image, with the `deploy` block commented out.
+
+## Configuration and storage
+
+[.env.example](.env.example) documents detection, tracking, gallery, email, and dashboard options. Email alerts require `EMAIL_SENDER`, `EMAIL_PASSWORD`, and `EMAIL_RECEIVER`; detection works without them. Use an app password where required by your mail provider.
+
+Gallery files persist in `gallery_segmented/`; `data/` is mounted at `/app/data`. The first run needs internet access to download MobileNet weights. `DASHBOARD_PORT` changes the dashboard port, defaulting to 5000.
 
 ```bash
 docker compose logs -f person-detector
-```
-
-Rebuild images:
-
-```bash
+docker compose down
 docker compose build --no-cache
 ```
 
 ## Troubleshooting
 
-### Camera not found
+- **Camera permission denied:** allow camera access in the browser and operating system, then click Start camera again. Use a localhost URL or HTTPS.
+- **Camera unavailable:** close other camera applications, try another camera in the selector, and check operating system permissions. If disconnected, reconnect it and click Start camera again.
+- **Another tab is sending video:** stop capture in that tab, close it, or wait 15 seconds for its session to expire.
+- **No capture after closing/minimizing the browser:** browser capture depends on the tab remaining active. Use Linux direct device mode or a network stream for unattended operation.
+- **Old bridge connection error:** replace the old `http://host.docker.internal:8080/video.mjpg` source in `.env` with `SOURCE=browser`, remove any old `extra_hosts` configuration, and rebuild/recreate the container.
+- **Linux device missing:** verify the selected `/dev/video*` exists and that the container can access it. The browser mode needs no device mapping.
+- **CUDA unavailable:** check GPU prerequisites and the commented `deploy` block, or use `DEVICE=auto` without that block for CPU operation.
+- **Model path error:** ensure `yolo26n-seg.pt` is a file in the project directory. The app requires segmentation weights (`*-seg.pt`).
 
-If Docker says the camera device is missing, check the host:
-
-```bash
-ls -l /dev/video*
-```
-
-Then set the matching value in [.env](.env):
-
-```env
-VIDEO_DEVICE=/dev/video0
-```
-
-or
-
-```env
-VIDEO_DEVICE=/dev/video2
-```
-
-### Docker permission errors
-
-Ensure your user can access the Docker socket:
-
-```bash
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-### GPU not available inside the container
-
-Verify the NVIDIA Container Toolkit is installed and the host GPU is visible:
-
-```bash
-nvidia-smi
-```
-
-## Notes
-
-- The app stores gallery and sample data under `gallery_segmented/`
-- Model weights are mounted from the project directory and can be replaced with your preferred YOLO segmentation model
-- The dashboard is served on port `5000` by default
-
-## Recommended long-term structure
-
-Use one canonical documentation file, [README.md](README.md), for the full project setup and keep any Docker-specific note as a short compatibility pointer if needed.
+Main files: [detect_and_email.py](detect_and_email.py), [docker-compose.yml](docker-compose.yml), [Dockerfile](Dockerfile), and [requirements.txt](requirements.txt).
