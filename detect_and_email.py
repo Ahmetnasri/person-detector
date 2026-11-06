@@ -391,11 +391,96 @@ class BrowserCamera:
             self.condition.notify_all()
             return True
 
-    def read(self):
+    def read(self, timeout=1, with_session=False):
         with self.condition:
-            self.condition.wait_for(lambda: self.pending is not None, timeout=1)
+            self.condition.wait_for(lambda: self.pending is not None, timeout=timeout)
             frame, self.pending = self.pending, None
-            return frame if self._active() else None
+            frame = frame if self._active() else None
+            return (frame, self.token) if with_session else frame
+
+
+class CameraLiveState:
+    """Per-camera feed and counters, with shared gallery/dashboard totals."""
+
+    def __init__(self, parent, camera_id):
+        self.parent = parent
+        self.camera_id = camera_id
+        self.frame_cond = threading.Condition()
+        self.frame_jpeg = None
+        self.frame_seq = 0
+        self.frames = 0
+        self.received = 0
+        self.fps = 0.0
+        self.last_frame_ts = None
+        self.last_received_ts = None
+        self.processing = False
+        self.running = False
+        parent.cameras.append(self)
+
+    def receive(self):
+        with self.parent.lock:
+            self.received += 1
+            self.last_received_ts = time.time()
+            self.running = self.parent.running = True
+
+    def tick_frame(self, now):
+        with self.parent.lock:
+            if self.last_frame_ts is not None and now > self.last_frame_ts:
+                rate = 1 / (now - self.last_frame_ts)
+                self.fps = rate if self.fps == 0 else 0.9 * self.fps + 0.1 * rate
+            self.last_frame_ts = now
+            self.frames += 1
+            self.parent.tick_frame(now)
+
+    def push_frame(self, jpeg):
+        with self.frame_cond:
+            self.frame_jpeg = jpeg
+            self.frame_seq += 1
+            self.frame_cond.notify_all()
+        if self.camera_id == 0:
+            self.parent.push_frame(jpeg)
+
+    def add_event(self, *args):
+        self.parent.add_event(*args, camera_id=self.camera_id)
+
+    def snapshot(self, now):
+        with self.parent.lock:
+            receiving = self.running and self.last_received_ts is not None and now - self.last_received_ts < 10
+            status = "Processing" if self.processing else "Live" if receiving and self.last_frame_ts else "Frames received" if receiving else "Waiting for camera"
+            return {
+                "id": self.camera_id, "name": f"Camera {self.camera_id + 1}",
+                "received": self.received, "frames": self.frames, "fps": round(self.fps, 2),
+                "last_received_ts": self.last_received_ts, "last_frame_ts": self.last_frame_ts,
+                "processing": self.processing, "running": receiving or self.processing, "status": status,
+            }
+
+
+def process_browser_batch(detector, cameras, pipelines, predict_options):
+    """Take the latest frame from each ready camera and infer one fair, bounded batch."""
+    ready = []
+    for camera, pipeline in zip(cameras, pipelines):
+        frame, token = camera.read(timeout=0, with_session=True)
+        if frame is not None:
+            if getattr(pipeline, "camera_session", None) != token:
+                pipeline.tracks.clear()
+                pipeline.camera_session = token
+            ready.append((frame, pipeline))
+    if not ready:
+        return False
+    for _, pipeline in ready:
+        with pipeline.state.parent.lock:
+            pipeline.state.processing = True
+    try:
+        results = detector(source=[frame for frame, _ in ready], **predict_options)
+        if len(results) != len(ready):
+            raise RuntimeError("Detector returned an unexpected number of camera results")
+        for result, (_, pipeline) in zip(results, ready):
+            pipeline.process(result)
+    finally:
+        for _, pipeline in ready:
+            with pipeline.state.parent.lock:
+                pipeline.state.processing = False
+    return True
 
 
 class LiveState:
@@ -404,7 +489,8 @@ class LiveState:
     TIMELINE_MINUTES = 30
 
     def __init__(self, source, recent_limit, email_enabled, device="auto"):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.cameras = []
         self.frame_cond = threading.Condition()
         self.frame_jpeg = None
         self.frame_seq = 0
@@ -441,12 +527,13 @@ class LiveState:
             self.frame_seq += 1
             self.frame_cond.notify_all()
 
-    def add_event(self, identity, score, is_new, crop_jpeg, now):
+    def add_event(self, identity, score, is_new, crop_jpeg, now, camera_id=None):
         with self.lock:
             self._event_id += 1
             self.recent.appendleft({
                 "id": self._event_id, "identity": identity, "score": score,
                 "is_new": is_new, "ts": now, "jpeg": crop_jpeg,
+                "camera_id": camera_id,
             })
             self.detections += 1
             self.new_people += int(is_new)
@@ -474,6 +561,7 @@ class LiveState:
     def snapshot(self):
         now = time.time()
         with self.lock:
+            cameras = [camera.snapshot(now) for camera in self.cameras]
             current = int(now // 60) * 60
             timeline = [
                 {"t": m, "count": self.minutes.get(m, 0)}
@@ -482,13 +570,14 @@ class LiveState:
             return {
                 "now": now,
                 "source": self.source,
+                "cameras": cameras,
                 "compute": {
                     "device": self.device,
                     "cuda_available": self.cuda_available,
                     "using_gpu": self.cuda_available and self.device.startswith("cuda"),
                 },
-                "running": self.running and (self.source != "browser" or (
-                    self.last_frame_ts is not None and now - self.last_frame_ts < 5)),
+                "running": self.running and (any(camera["running"] for camera in cameras) if cameras else (
+                    self.source != "browser" or (self.last_frame_ts is not None and now - self.last_frame_ts < 5))),
                 "started": self.started,
                 "frames": self.frames,
                 "detections": self.detections,
@@ -638,6 +727,24 @@ class Pipeline:
 
 # --------------------------------------------------------------------------- dashboard
 
+def camera_panel(camera_id):
+    suffix = "" if camera_id == 0 else f"-{camera_id + 1}"
+    return f"""<section class="panel" data-camera="{camera_id}">
+      <div class="panel-head"><h2>Camera {camera_id + 1}</h2><span class="hint" id="camera-stats{suffix}">Waiting for camera</span></div>
+      <div id="camera-controls{suffix}" hidden>
+        <div class="controls" style="flex-wrap:wrap;margin-bottom:8px">
+          <select id="camera-device{suffix}" aria-label="Camera {camera_id + 1} device"><option value="">Default camera</option></select>
+          <button class="close" id="camera-start{suffix}">Start camera</button>
+          <button class="close" id="camera-stop{suffix}" disabled>Stop camera</button>
+        </div>
+        <p id="camera-message{suffix}" role="status">Select a camera and allow access. Keep this tab open.</p>
+        <video id="camera-preview{suffix}" autoplay muted playsinline style="width:120px;border-radius:8px" hidden></video>
+        <canvas id="camera-canvas{suffix}" hidden></canvas>
+      </div>
+      <div class="feed"><span class="ph">Waiting for frames…</span><img src="/stream/{camera_id}.mjpg" alt="Camera {camera_id + 1} annotated feed"></div>
+    </section>"""
+
+
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -682,6 +789,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .tile .value { font-size: 30px; font-weight: 600; margin-top: 2px; }
   .tile .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); gap: 20px; }
+  .camera-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 20px; }
   @media (max-width: 1000px) { .row { grid-template-columns: 1fr; } }
   .panel { padding: 16px 18px; min-width: 0; }
   .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -759,33 +867,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 </header>
 
 <main>
-  <section class="panel" id="camera-controls" hidden>
-    <div class="panel-head">
-      <h2>Camera</h2>
-      <div class="controls">
-        <select id="camera-device" aria-label="Camera"><option value="">Default camera</option></select>
-        <button class="close" id="camera-start">Start camera</button>
-        <button class="close" id="camera-stop" disabled>Stop camera</button>
-      </div>
-    </div>
-    <p id="camera-message" role="status">Start the camera and allow access. Keep this tab open while detecting.</p>
-    <video id="camera-preview" autoplay muted playsinline style="width:160px;border-radius:8px" hidden></video>
-    <canvas id="camera-canvas" hidden></canvas>
-  </section>
   <section class="kpis" id="kpis"></section>
-
-  <section class="row">
-    <div class="panel">
-      <div class="panel-head">
-        <h2>Live feed</h2>
-        <div class="legend"><span style="--c:var(--new)">New person</span><span style="--c:var(--accent)">Known person</span></div>
-      </div>
-      <div class="feed"><span class="ph">Waiting for frames…</span><img src="/stream.mjpg" alt="Live annotated camera feed"></div>
-    </div>
-    <div class="panel">
-      <div class="panel-head"><h2>Recent detections</h2><span class="hint" id="recent-count"></span></div>
-      <div class="activity" id="activity"></div>
-    </div>
+  <section class="camera-grid">__CAMERA_PANELS__</section>
+  <section class="panel">
+    <div class="panel-head"><h2>Recent detections</h2><span class="hint" id="recent-count"></span></div>
+    <div class="activity" id="activity"></div>
   </section>
 
   <section class="panel">
@@ -835,111 +921,135 @@ function duration(s) {
 function setHTML(el, html) { if (el._html !== html) { el.innerHTML = html; el._html = html; } }
 
 let state = null, identities = [];
-let cameraMedia = null, cameraToken = null, cameraStarting = false, uploadAbort = null;
-let cameraRelease = Promise.resolve();
+class CameraCapture {
+  constructor(id) {
+    this.id = id;
+    this.media = null;
+    this.token = null;
+    this.starting = false;
+    this.abort = null;
+    this.release = Promise.resolve();
+    this.el("start").addEventListener("click", () => this.start());
+    this.el("stop").addEventListener("click", () => this.stop());
+  }
+  el(name) { return $(`#camera-${name}${this.id === 0 ? "" : "-" + (this.id + 1)}`); }
+  get deviceId() { return this.media?.getVideoTracks()[0]?.getSettings().deviceId; }
+  endpoint(action) { return `/api/camera/${this.id}/${action}`; }
 
-async function cameraDevices(selected = "") {
-  if (!navigator.mediaDevices?.enumerateDevices) return;
-  const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
-  const select = $("#camera-device");
-  select.innerHTML = '<option value="">Default camera</option>';
-  devices.forEach((device, i) => select.add(new Option(device.label || `Camera ${i + 1}`, device.deviceId)));
-  select.value = selected;
-}
+  stop(message = "Camera stopped. Click Start camera to resume.") {
+    const token = this.token;
+    this.token = null;
+    this.abort?.abort();
+    this.media?.getTracks().forEach(track => track.stop());
+    this.media = null;
+    this.el("preview").srcObject = null;
+    this.el("preview").hidden = true;
+    this.el("start").disabled = this.starting;
+    this.el("stop").disabled = true;
+    this.el("device").disabled = false;
+    this.el("message").textContent = message;
+    if (token) this.release = fetch(this.endpoint("stop"), {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({token}), keepalive: true,
+    }).catch(() => {});
+    refreshCameraDevices().catch(() => {});
+  }
 
-function stopCamera(message = "Camera stopped. Click Start camera to resume.") {
-  const token = cameraToken;
-  cameraToken = null;
-  uploadAbort?.abort();
-  cameraMedia?.getTracks().forEach(track => track.stop());
-  cameraMedia = null;
-  $("#camera-preview").srcObject = null;
-  $("#camera-preview").hidden = true;
-  $("#camera-start").disabled = cameraStarting;
-  $("#camera-stop").disabled = true;
-  $("#camera-device").disabled = false;
-  $("#camera-message").textContent = message;
-  if (token) cameraRelease = fetch("/api/camera/stop", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({token}), keepalive: true,
-  }).catch(() => {});
-}
-
-async function uploadCamera(token) {
-  const video = $("#camera-preview"), canvas = $("#camera-canvas");
-  const context = canvas.getContext("2d");
-  while (cameraToken === token && cameraMedia) {
-    try {
-      if (!video.videoWidth || video.readyState < 2) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-        continue;
-      }
-      canvas.width = Math.min(640, video.videoWidth);
-      canvas.height = Math.round(video.videoHeight * canvas.width / video.videoWidth);
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.8));
-      if (cameraToken !== token) return;
-      if (!blob) throw new Error("Could not capture a camera frame.");
-      const controller = new AbortController();
-      uploadAbort = controller;
-      const timer = setTimeout(() => controller.abort(), 10000);
-      let response;
+  async upload(token) {
+    const video = this.el("preview"), canvas = this.el("canvas");
+    const context = canvas.getContext("2d");
+    while (this.token === token && this.media) {
       try {
-        response = await fetch("/api/camera/frame", {
-          method: "POST", headers: {"Content-Type": "image/jpeg", "X-Camera-Token": token},
-          body: blob, signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
+        if (!video.videoWidth || video.readyState < 2) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          continue;
+        }
+        canvas.width = Math.min(640, video.videoWidth);
+        canvas.height = Math.round(video.videoHeight * canvas.width / video.videoWidth);
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.8));
+        if (this.token !== token) return;
+        if (!blob) throw new Error("Could not capture a camera frame.");
+        const controller = new AbortController();
+        this.abort = controller;
+        const timer = setTimeout(() => controller.abort(), 10000);
+        let response;
+        try {
+          response = await fetch(this.endpoint("frame"), {
+            method: "POST", headers: {"Content-Type": "image/jpeg", "X-Camera-Token": token},
+            body: blob, signal: controller.signal,
+          });
+        } finally { clearTimeout(timer); }
+        if (!response.ok) throw new Error(response.status === 409
+          ? "Camera session expired. Start this camera again." : "Frame upload failed. Check the container logs.");
+        if (this.token === token) this.el("message").textContent = "Camera active. Keep this tab open; closing it stops capture.";
+        await new Promise(resolve => setTimeout(resolve, 250));
+      } catch (error) {
+        if (this.token === token) this.stop(error.name === "AbortError"
+          ? "Connection timed out. Check Docker and start this camera again." : error.message);
+        return;
       }
+    }
+  }
+
+  async start() {
+    if (this.starting || this.media) return;
+    this.starting = true;
+    this.el("start").disabled = true;
+    this.el("message").textContent = "Waiting for camera permission…";
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access needs localhost or HTTPS.");
+      await this.release;
+      const deviceId = this.el("device").value;
+      if (deviceId && captures.some(c => c !== this && c.deviceId === deviceId)) throw new Error("Select a different camera; that device is already active.");
+      this.media = await navigator.mediaDevices.getUserMedia({
+        audio: false, video: {width: {ideal: 640}, height: {ideal: 480},
+          ...(deviceId ? {deviceId: {exact: deviceId}} : {})},
+      });
+      if (this.deviceId && captures.some(c => c !== this && c.deviceId === this.deviceId)) throw new Error("Select a different camera; that device is already active.");
+      const preview = this.el("preview");
+      preview.srcObject = this.media;
+      preview.hidden = false;
+      await preview.play();
+      await refreshCameraDevices();
+      const response = await fetch(this.endpoint("start"), {method: "POST"});
       if (!response.ok) throw new Error(response.status === 409
-        ? "Camera session expired. Start the camera again." : "Frame upload failed. Check the container logs.");
-      if (cameraToken === token) $("#camera-message").textContent = "Camera active. Keep this tab open; closing it stops capture.";
-      await new Promise(resolve => setTimeout(resolve, 250));
+        ? "Another tab is using this camera slot. Stop it or wait 15 seconds after closing it." : "Could not start camera capture.");
+      this.token = (await response.json()).token;
+      this.media.getVideoTracks()[0].addEventListener("ended", () => this.stop("Camera disconnected. Reconnect it and start again."));
+      this.el("stop").disabled = false;
+      this.el("device").disabled = true;
+      this.upload(this.token);
     } catch (error) {
-      if (cameraToken === token) stopCamera(error.name === "AbortError"
-        ? "Connection timed out. Check Docker and start the camera again." : error.message);
-      return;
+      this.stop(error.name === "NotAllowedError" ? "Camera permission denied. Allow access in your browser and try again." : error.message);
+    } finally {
+      this.starting = false;
+      this.el("start").disabled = !!this.media;
     }
   }
 }
 
-$("#camera-start").addEventListener("click", async () => {
-  if (cameraStarting || cameraMedia) return;
-  cameraStarting = true;
-  $("#camera-start").disabled = true;
-  $("#camera-message").textContent = "Waiting for camera permission…";
-  try {
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access needs localhost or HTTPS. Open this dashboard using localhost.");
-    await cameraRelease;
-    const deviceId = $("#camera-device").value;
-    cameraMedia = await navigator.mediaDevices.getUserMedia({
-      audio: false, video: {width: {ideal: 640}, height: {ideal: 480},
-        ...(deviceId ? {deviceId: {exact: deviceId}} : {})},
+const captures = [...document.querySelectorAll("[data-camera]")].map(panel => new CameraCapture(+panel.dataset.camera));
+async function refreshCameraDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+  captures.forEach(capture => {
+    const select = capture.el("device");
+    const selected = capture.deviceId || select.value;
+    select.innerHTML = '<option value="">Default camera</option>';
+    devices.forEach((device, i) => {
+      const option = new Option(device.label || `Camera ${i + 1}`, device.deviceId);
+      option.disabled = !!device.deviceId && captures.some(c => c !== capture && c.deviceId === device.deviceId);
+      select.add(option);
     });
-    const preview = $("#camera-preview");
-    preview.srcObject = cameraMedia;
-    preview.hidden = false;
-    await preview.play();
-    await cameraDevices(cameraMedia.getVideoTracks()[0].getSettings().deviceId);
-    const response = await fetch("/api/camera/start", {method: "POST"});
-    if (!response.ok) throw new Error(response.status === 409
-      ? "Another tab is sending camera video. Stop it or wait 15 seconds after closing it." : "Could not start camera capture.");
-    cameraToken = (await response.json()).token;
-    cameraMedia.getVideoTracks()[0].addEventListener("ended", () => stopCamera("Camera disconnected. Reconnect it and start again."));
-    $("#camera-stop").disabled = false;
-    $("#camera-device").disabled = true;
-    uploadCamera(cameraToken);
-  } catch (error) {
-    stopCamera(error.name === "NotAllowedError" ? "Camera permission denied. Allow camera access in your browser and try again." : error.message);
-  } finally {
-    cameraStarting = false;
-    $("#camera-start").disabled = !!cameraMedia;
-  }
-});
-$("#camera-stop").addEventListener("click", () => stopCamera());
-window.addEventListener("pagehide", () => stopCamera());
-cameraDevices().catch(() => {});
+    const previous = [...select.options].find(o => o.value === selected && !o.disabled);
+    const preferred = select.options[capture.id + 1];
+    select.value = previous && selected ? selected : preferred && !preferred.disabled ? preferred.value
+      : [...select.options].find(o => o.value && !o.disabled)?.value || "";
+  });
+}
+window.addEventListener("pagehide", () => captures.forEach(c => c.stop()));
+refreshCameraDevices().catch(() => {});
 
 async function poll() {
   try {
@@ -957,10 +1067,16 @@ async function poll() {
 function render() {
   const s = state, now = Date.now() / 1000;
   $("#source").textContent = "Source: " + s.source;
-  $("#camera-controls").hidden = s.source !== "browser";
+  captures.forEach(capture => {
+    capture.el("controls").hidden = s.source !== "browser";
+    const camera = s.cameras?.find(c => c.id === capture.id);
+    capture.el("stats").textContent = camera
+      ? `${camera.status} · ${camera.received} received · ${camera.frames} analysed · ${camera.fps.toFixed(1)} fps`
+      : `${s.frames} analysed · ${s.fps.toFixed(1)} fps`;
+  });
   const live = s.running && s.last_frame_ts && now - s.last_frame_ts < 10;
   $("#dot").className = "dot" + (live ? " live" : "");
-  $("#status").textContent = live ? "Live" : s.source === "browser" ? "Waiting for camera" : s.running ? "Waiting for frames" : "Source finished";
+  $("#status").textContent = s.cameras?.some(c => c.processing) ? "Processing" : live ? "Live" : s.source === "browser" ? "Waiting for camera" : s.running ? "Waiting for frames" : "Source finished";
 
   const e = s.email;
   const emailSub = !e.enabled ? "Email alerts disabled"
@@ -982,7 +1098,7 @@ function render() {
   setHTML($("#activity"), s.recent.length ? s.recent.map(ev => `
     <div class="event" data-name="${esc(ev.identity)}">
       <img src="${ev.img}" alt="">
-      <div><div class="who">${esc(ev.identity)}</div><div class="meta">${ago(ev.ts)}</div></div>
+      <div><div class="who">${esc(ev.identity)}</div><div class="meta">${ago(ev.ts)}${ev.camera_id != null ? ` · Camera ${ev.camera_id + 1}` : ""}</div></div>
       <div class="right">${ev.is_new
         ? `<span class="tag" style="--c:var(--new)">New person</span>`
         : `<span class="tag" style="--c:var(--accent)">Match ${ev.score.toFixed(2)}</span>`}</div>
@@ -1095,6 +1211,10 @@ poll();
 
 def build_dashboard(state, gallery, browser_camera=None):
     app = Flask(__name__)
+    browser_cameras = browser_camera if isinstance(browser_camera, list) else [browser_camera] if browser_camera else []
+    if browser_cameras and not state.cameras:
+        for camera_id in range(len(browser_cameras)):
+            CameraLiveState(state, camera_id)
     app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
@@ -1105,18 +1225,27 @@ def build_dashboard(state, gallery, browser_camera=None):
             origin = request.headers.get("Origin")
             if origin and origin != request.host_url.rstrip("/"):
                 abort(403)
-            if browser_camera is None:
+            if not browser_cameras:
                 abort(404)
 
+    def select_camera(camera_id):
+        if camera_id < 0 or camera_id >= len(browser_cameras):
+            abort(404)
+        return browser_cameras[camera_id], state.cameras[camera_id]
+
     @app.post("/api/camera/start")
-    def camera_start():
-        token = browser_camera.start()
+    @app.post("/api/camera/<int:camera_id>/start")
+    def camera_start(camera_id=0):
+        camera, _ = select_camera(camera_id)
+        token = camera.start()
         if token is None:
             return jsonify(error="Another browser camera is active"), 409
         return jsonify(token=token)
 
     @app.post("/api/camera/frame")
-    def camera_frame():
+    @app.post("/api/camera/<int:camera_id>/frame")
+    def camera_frame(camera_id=0):
+        camera, camera_state = select_camera(camera_id)
         if request.mimetype != "image/jpeg":
             abort(415)
         data = request.get_data()
@@ -1128,22 +1257,26 @@ def build_dashboard(state, gallery, browser_camera=None):
             frame = None
         if frame is None or max(frame.shape[:2]) > 1920 or frame.shape[0] * frame.shape[1] > 1920 * 1080:
             abort(400, "Invalid frame or frame exceeds 1920x1080 pixels")
-        if not browser_camera.submit(request.headers.get("X-Camera-Token"), frame):
+        if not camera.submit(request.headers.get("X-Camera-Token"), frame):
             return jsonify(error="Camera session expired"), 409
-        state.running = True
+        camera_state.receive()
         return "", 204
 
     @app.post("/api/camera/stop")
-    def camera_stop():
+    @app.post("/api/camera/<int:camera_id>/stop")
+    def camera_stop(camera_id=0):
+        camera, camera_state = select_camera(camera_id)
         data = request.get_json(silent=True) or {}
-        if not isinstance(data, dict) or not browser_camera.stop(data.get("token")):
+        if not isinstance(data, dict) or not camera.stop(data.get("token")):
             return jsonify(error="Camera session expired"), 409
-        state.running = False
+        with state.lock:
+            camera_state.running = False
         return "", 204
 
     @app.route("/")
     def index():
-        return Response(DASHBOARD_HTML, mimetype="text/html")
+        panels = "".join(camera_panel(i) for i in range(len(browser_cameras) or 1))
+        return Response(DASHBOARD_HTML.replace("__CAMERA_PANELS__", panels), mimetype="text/html")
 
     @app.route("/api/state")
     def api_state():
@@ -1168,13 +1301,22 @@ def build_dashboard(state, gallery, browser_camera=None):
         return send_from_directory(gallery.root.resolve(), filename)
 
     @app.route("/stream.mjpg")
-    def stream():
+    @app.route("/stream/<int:camera_id>.mjpg")
+    def stream(camera_id=0):
+        if state.cameras:
+            if camera_id >= len(state.cameras):
+                abort(404)
+            feed = state.cameras[camera_id]
+        elif camera_id == 0:
+            feed = state
+        else:
+            abort(404)
         def frames():
             last = -1
             while True:
-                with state.frame_cond:
-                    state.frame_cond.wait_for(lambda: state.frame_seq != last, timeout=5)
-                    seq, jpeg = state.frame_seq, state.frame_jpeg
+                with feed.frame_cond:
+                    feed.frame_cond.wait_for(lambda: feed.frame_seq != last, timeout=5)
+                    seq, jpeg = feed.frame_seq, feed.frame_jpeg
                 if jpeg is None:
                     continue
                 last = seq  # on timeout we resend the last frame, which also detects closed clients
@@ -1241,7 +1383,8 @@ def main():
     gallery = Gallery(args.gallery, embedder.dim, max(1, args.max_samples), io)
     print(f"Loaded {len(gallery.people)} known identities from '{args.gallery}/'")
     state = LiveState(str(args.source), max(1, args.latest_count), email_on, device=device)
-    browser_camera = BrowserCamera() if args.source == "browser" else None
+    browser_cameras = [BrowserCamera(), BrowserCamera()] if args.source == "browser" else []
+    camera_states = [CameraLiveState(state, i) for i in range(len(browser_cameras))]
 
     emailer = None
     if email_on:
@@ -1250,7 +1393,7 @@ def main():
         emailer.start()
 
     if args.dashboard:
-        app = build_dashboard(state, gallery, browser_camera)
+        app = build_dashboard(state, gallery, browser_cameras)
         threading.Thread(
             target=app.run, daemon=True, name="dashboard",
             kwargs={"host": args.host, "port": args.dashboard_port, "threaded": True, "use_reloader": False},
@@ -1258,18 +1401,20 @@ def main():
         print(f"Dashboard: http://localhost:{args.dashboard_port}")
 
     pipeline = Pipeline(args, embedder, gallery, state, emailer)
+    camera_pipelines = [
+        Pipeline(argparse.Namespace(**(vars(args) | {"source": f"Camera {i + 1}"})),
+                 embedder, gallery, camera_state, emailer)
+        for i, camera_state in enumerate(camera_states)
+    ]
     predict_options = dict(conf=args.conf, imgsz=args.imgsz, classes=[0], device=device,
                            half=device.startswith("cuda"), retina_masks=True, verbose=False)
 
     try:
-        if browser_camera is not None:
-            print("Open the dashboard and click Start camera. Waiting for browser frames...")
+        if browser_cameras:
+            print("Open the dashboard, select two different cameras, and start each camera.")
             while True:
-                frame = browser_camera.read()
-                if frame is not None:
-                    # Browser uploads are already rate limited; frame-gap applies to video streams only.
-                    for result in detector(source=frame, **predict_options):
-                        pipeline.process(result)
+                if not process_browser_batch(detector, browser_cameras, camera_pipelines, predict_options):
+                    time.sleep(0.02)
         else:
             stream = detector(source=args.source, stream=True,
                               vid_stride=max(1, args.frame_gap), **predict_options)
