@@ -446,7 +446,14 @@ class CameraLiveState:
     def snapshot(self, now):
         with self.parent.lock:
             receiving = self.running and self.last_received_ts is not None and now - self.last_received_ts < 10
-            status = "Processing" if self.processing else "Live" if receiving and self.last_frame_ts else "Frames received" if receiving else "Waiting for camera"
+            if self.processing:
+                status = "Processing"
+            elif not receiving:
+                status = "Waiting for camera"
+            elif self.last_frame_ts is None:
+                status = "Frames received"
+            else:
+                status = "Live"
             return {
                 "id": self.camera_id, "name": f"Camera {self.camera_id + 1}",
                 "received": self.received, "frames": self.frames, "fps": round(self.fps, 2),
@@ -504,6 +511,7 @@ class LiveState:
         self.detections = 0
         self.new_people = 0
         self.fps = 0.0
+        self._frame_times = deque(maxlen=60)
         self.last_frame_ts = None
         self.emails_sent = 0
         self.emails_failed = 0
@@ -514,10 +522,11 @@ class LiveState:
 
     def tick_frame(self, now):
         with self.lock:
-            if self.last_frame_ts is not None:
-                dt = now - self.last_frame_ts
-                if dt > 0:
-                    self.fps = (1.0 / dt) if self.fps == 0 else 0.9 * self.fps + 0.1 / dt
+            self._frame_times.append(now)
+            elapsed = now - self._frame_times[0]
+            if elapsed >= 0.25:
+                # Batch results arrive together; instantaneous 1/dt would overstate throughput.
+                self.fps = (len(self._frame_times) - 1) / elapsed
             self.last_frame_ts = now
             self.frames += 1
 
@@ -845,6 +854,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .dialog-head h3 { margin: 0; font-size: 18px; }
   .close { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 8px;
            padding: 4px 10px; cursor: pointer; font: inherit; }
+  button:disabled { opacity: .45; cursor: default; }
   .detail { display: grid; grid-template-columns: minmax(0, 3fr) minmax(220px, 1fr); gap: 18px; }
   @media (max-width: 800px) { .detail { grid-template-columns: 1fr; } }
   .detail .frame { width: 100%; border-radius: 8px; background: #000; display: block; }

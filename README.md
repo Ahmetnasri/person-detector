@@ -14,11 +14,15 @@ On Windows use Docker Desktop with Linux containers and the WSL 2 backend. On Li
    docker compose up --build -d
    ```
 
-4. Open **http://localhost:5000**, click **Start camera**, and allow browser camera access. To change cameras, stop capture, select another camera, and start again. Device names may only appear after permission is granted.
+4. Open **http://localhost:5000**. In **Camera 1**, select the first webcam, click **Start camera**, and allow browser access. In **Camera 2**, select a different webcam and click **Start camera**. Both cameras capture and stream to the same container. You can also start just one camera. Device names may only appear after permission is granted for the first camera.
 
-The browser captures your webcam and uploads JPEG frames to detection inside Docker at up to four frames per second. Only the latest pending frame is kept so slow inference does not build a video backlog. `FRAME_GAP` applies to direct camera/video/stream sources; browser uploads are already rate limited.
+Each camera uploads JPEG frames at up to four frames per second. Each has its own annotated feed, controls, received/analysed frame counts, and processing rate. Stopping or disconnecting one camera does not stop the other. A device already active in one panel cannot be selected in the other.
 
-**Browser mode requires the camera tab to stay open.** Closing it, navigating away, or stopping the camera ends capture; reopening the dashboard and clicking Start camera resumes it. Browsers may also throttle or suspend background tabs. The container, dashboard, and stored gallery remain available. Only one browser tab can send camera frames at a time; abandoned sessions expire after 15 seconds.
+The detector consumes the latest available frame from each camera in a batch, sharing one YOLO model and embedder. Only one pending frame per camera is retained, so slow inference does not build a backlog or let one camera monopolize the queue. Tracking is separate for each view; the identity gallery is shared, allowing appearance matching across cameras. Recent events and email alerts identify the camera. `FRAME_GAP` applies to direct camera/video/stream sources; browser uploads are already rate limited.
+
+Two cameras increase processing load. On a slow CPU, try `IMGSZ=320`; this can reduce detection accuracy. Each panel distinguishes frames received from frames analysed and shows **Processing** during inference, even when a frame takes several seconds.
+
+**Browser mode requires the camera tab to stay open.** Closing it or navigating away stops both captures; reopening the dashboard and starting the cameras resumes them. Each camera can also be stopped independently. Browsers may throttle or suspend background tabs. The container, dashboard, and stored gallery remain available. Each camera slot has its own browser session owner; abandoned sessions expire after 15 seconds.
 
 Camera permission requires `localhost` or HTTPS. The dashboard is published on host loopback by default; a remote browser camera would belong to that browser's machine, and remote access requires HTTPS and an explicitly configured host port binding.
 
@@ -40,7 +44,7 @@ Apply the configuration:
 docker compose up -d --force-recreate
 ```
 
-This mode starts detection automatically and continues with the dashboard closed. Switch back to browser mode by setting `SOURCE=browser`, commenting out `devices`, and recreating the container.
+This direct mode reads one camera automatically and continues with the dashboard closed. For two USB cameras on either Windows or Linux, use browser mode: set `SOURCE=browser`, comment out `devices`, and recreate the container.
 
 On Windows Docker Desktop, browser capture stops when the camera tab closes. Unattended capture needs a network camera/stream or separately configured, compatible USB passthrough; a Linux container cannot directly open a Windows webcam API. Moving capture code into the image does not expose that hardware automatically.
 
@@ -68,7 +72,8 @@ docker compose build --no-cache
 
 - **Camera permission denied:** allow camera access in the browser and operating system, then click Start camera again. Use a localhost URL or HTTPS.
 - **Camera unavailable:** close other camera applications, try another camera in the selector, and check operating system permissions. If disconnected, reconnect it and click Start camera again.
-- **Another tab is sending video:** stop capture in that tab, close it, or wait 15 seconds for its session to expire.
+- **Another tab is sending video:** stop that camera slot in the other tab, close it, or wait 15 seconds for its session to expire. The other slot can continue independently.
+- **Second camera cannot start:** select a different physical device, close other apps using it, and try separate USB ports if a shared hub cannot deliver both streams.
 - **No capture after closing/minimizing the browser:** browser capture depends on the tab remaining active. Use Linux direct device mode or a network stream for unattended operation.
 - **Old bridge connection error:** replace the old `http://host.docker.internal:8080/video.mjpg` source in `.env` with `SOURCE=browser`, remove any old `extra_hosts` configuration, and rebuild/recreate the container.
 - **Linux device missing:** verify the selected `/dev/video*` exists and that the container can access it. The browser mode needs no device mapping.

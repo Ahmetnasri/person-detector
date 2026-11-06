@@ -1,6 +1,9 @@
 # Git
 .git
 .gitignore
+.aws
+.codex
+.agents
 
 # Python
 __pycache__
@@ -19,7 +22,7 @@ build
 # Virtual environments
 venv
 env
-.env
+.env*
 .venv
 .venv-webcam
 

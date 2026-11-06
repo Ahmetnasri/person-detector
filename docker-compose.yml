@@ -1,4 +1,5 @@
-# WINDOWS + LINUX (default): SOURCE=browser. Open the dashboard and Start camera.
+# WINDOWS + LINUX: SOURCE=browser. Select two different devices in the dashboard.
+# Start each camera independently; both feeds are processed in the same container.
 # No host Python/helper is needed. The browser tab must stay open for capture.
 # LINUX unattended option: set SOURCE=0 and uncomment devices below.
 # GPU access is enabled below. Comment out deploy for machines without NVIDIA GPUs.
@@ -7,7 +8,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: person-detector:latest
+    image: ahmetnasri/person-detector:v3
     container_name: person-detector
     restart: unless-stopped
     init: true
